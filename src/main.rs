@@ -1,7 +1,6 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio::io::Result;
 
@@ -50,7 +49,7 @@ async fn serve_proxy(mut socket: TcpStream) -> Result<()> {
     
     let (dest_server, dest_port) = match dest.split_once(':') {
       Some(v) => {v}
-      None    => {return respond_failure(wr, &format!("unexpected HTTP verb: {verb}")).await}
+      None    => {return respond_failure(wr, &format!("failed to parse destination")).await}
     };
     
     if !dest_server.ends_with(".ton") {
@@ -79,29 +78,59 @@ async fn serve_proxy(mut socket: TcpStream) -> Result<()> {
     let mut server_socket = TcpStream::connect(server).await?;
     
     // copying buffer from `rd`
-    println!("{:?}", rd.buffer());
     if rd.buffer().len() > 0 {
       server_socket.write_all(rd.buffer()).await?;
     }
     drop(rd); drop(wr);
     
-    let mut test_buffer = [0; 540];
-    let n = socket.read(&mut test_buffer).await?;
-    server_socket.write_all(&test_buffer[..n]).await?;
-    println!("Test buffer: 0..{n} | {:?}", Vec::from(&test_buffer[..n]));
-    
-    test_buffer = [0; 540];
-    let n = server_socket.read(&mut test_buffer).await?;
-    socket.write_all(&test_buffer[..n]).await?;
-    println!("Reverse test buffer: 0..{n} | {:?}", Vec::from(&test_buffer[..n]));
-    
     tokio::io::copy_bidirectional(&mut socket, &mut server_socket).await?;
   } else if verb == "GET" {
-    wr.write_all(b"HTTP/1.0 200 OK\r\n").await?;
-    wr.write_all(b"Content-Type: text/plain\r\n").await?;
-    wr.write_all(b"Connection: close\r\n\r\n").await?;
-    wr.write_all( format!("proxy_to: {proxy_to:?}\r\n").as_bytes() ).await?;
-    wr.write_all( format!("request:  {request_params:?}\r\n").as_bytes() ).await?;
+    let proto_dest_url = request_params[1];
+    
+    let dest_url = match proto_dest_url.strip_prefix("http://") {
+      Some(v) => {v}
+      None    => {return respond_failure(wr, "not http:// protocol").await}
+    };
+    
+    let (server, url) = match dest_url.split_once('/') {
+      Some(v) => {v}
+      None    => {(dest_url, "")}
+    };
+    if server.contains(':') {
+      return respond_failure(wr, "supplying custom ports is not supported").await;
+    }
+    
+    let mut server = server.to_owned();
+    if server.ends_with(".ton") {
+      server += ".run";
+    }
+    
+    println!("Connecting to {server:?} /{url}");
+    
+    let mut server_socket = TcpStream::connect(format!("{server}:80")).await?;
+    server_socket.write_all(format!("GET /{url} HTTP/1.0\r\n").as_bytes()).await?;
+    
+    loop {
+      proxy_to.clear();
+      rd.read_line(&mut proxy_to).await?;
+      
+      if proxy_to.to_lowercase().starts_with("host:") {
+        server_socket.write_all(proxy_to.trim_end().as_bytes()).await?;
+        server_socket.write_all(b".run\r\n").await?;
+      } else {
+        server_socket.write_all(proxy_to.as_bytes()).await?;
+      }
+      
+      if proxy_to == "\r\n" {break;}
+    }
+    
+    // copying buffer from `rd`
+    if rd.buffer().len() > 0 {
+      server_socket.write_all(rd.buffer()).await?;
+    }
+    drop(rd); drop(wr);
+    
+    tokio::io::copy_bidirectional(&mut socket, &mut server_socket).await?;
   } else {
     respond_failure(wr, &format!("unexpected HTTP verb: {verb}")).await?;
   }
