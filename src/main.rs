@@ -1,6 +1,7 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio::io::Result;
 
@@ -44,24 +45,55 @@ async fn serve_proxy(mut socket: TcpStream) -> Result<()> {
   
   let request_params: Vec<&str> = proxy_to.split(' ').collect();
   let verb = request_params[0];
-  if verb == "PROXY" {
-    if request_params[1] != "TCP4" {
-      return respond_failure(wr, "unsupported protocol to forward").await;
-    }
+  if verb == "CONNECT" {
+    let dest = request_params[1];
     
-    let dest_ip   = request_params[3];
-    let dest_port = request_params[5];
-    
-    let dest_pt = match dest_port.parse() {
-      Ok(port) => {port}
-      Err(_)   => {return respond_failure(wr, "invalid destination port").await;}
+    let (dest_server, dest_port) = match dest.split_once(':') {
+      Some(v) => {v}
+      None    => {return respond_failure(wr, &format!("unexpected HTTP verb: {verb}")).await}
     };
     
-    let mut server_socket = TcpStream::connect((dest_ip, dest_pt)).await?;
+    if !dest_server.ends_with(".ton") {
+      return respond_failure(wr, &format!("not a .ton server: {dest_server}")).await;
+    }
+    if dest_port != "80" && dest_port != "8080" && dest_port != "443" {
+      return respond_failure(wr, "not a safe port (80/8080/443)").await;
+    }
+    if dest_port == "443" {
+      // terminating connection without response
+      return Err(Error::new(ErrorKind::Other, "TLS redirection breaks certificates chain"));
+    }
+    
+    let server = format!("{dest_server}.run:{dest_port}");  // foundation.ton.run:443
+    println!("Connecting to {server}");
+    
+    loop {
+      proxy_to.clear();
+      rd.read_line(&mut proxy_to).await?;
+      println!("Skipping headers line {proxy_to:?}");
+      if proxy_to == "\r\n" {break;}
+    }
+    
+    wr.write_all(b"HTTP/1.0 200 Connection established\r\n\r\n").await?;
+    
+    let mut server_socket = TcpStream::connect(server).await?;
     
     // copying buffer from `rd`
-    server_socket.write_all(rd.buffer()).await?;
-    drop(rd);
+    println!("{:?}", rd.buffer());
+    if rd.buffer().len() > 0 {
+      server_socket.write_all(rd.buffer()).await?;
+    }
+    drop(rd); drop(wr);
+    
+    let mut test_buffer = [0; 540];
+    let n = socket.read(&mut test_buffer).await?;
+    server_socket.write_all(&test_buffer[..n]).await?;
+    println!("Test buffer: 0..{n} | {:?}", Vec::from(&test_buffer[..n]));
+    
+    test_buffer = [0; 540];
+    let n = server_socket.read(&mut test_buffer).await?;
+    socket.write_all(&test_buffer[..n]).await?;
+    println!("Reverse test buffer: 0..{n} | {:?}", Vec::from(&test_buffer[..n]));
     
     tokio::io::copy_bidirectional(&mut socket, &mut server_socket).await?;
   } else if verb == "GET" {
