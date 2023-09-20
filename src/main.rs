@@ -33,6 +33,14 @@ async fn respond_failure(mut wr: impl AsyncWriteExt+Unpin, reason: &str) -> Resu
   Err(Error::new(ErrorKind::Other, reason))
 }
 
+fn is_tracking_server(server: &str) -> bool {
+     server.ends_with("google-analytics.com")
+  || server.ends_with("g.doubleclick.net")
+  || server.ends_with("location.services.mozilla.com")
+  || server.ends_with("mc.yandex.ru")
+  || server.ends_with("mc.yandex.md")
+}
+
 async fn serve_proxy(mut socket: TcpStream) -> Result<()> {
   let (rd, mut wr) = socket.split();
   let mut rd = BufReader::new(rd);
@@ -51,25 +59,30 @@ async fn serve_proxy(mut socket: TcpStream) -> Result<()> {
       Some(v) => {v}
       None    => {return respond_failure(wr, &format!("failed to parse destination")).await}
     };
-    
-    if !dest_server.ends_with(".ton") {
-      return respond_failure(wr, &format!("not a .ton server: {dest_server}")).await;
-    }
     if dest_port != "80" && dest_port != "8080" && dest_port != "443" {
       return respond_failure(wr, "not a safe port (80/8080/443)").await;
     }
-    if dest_port == "443" {
+    
+    if is_tracking_server(dest_server) {
       // terminating connection without response
-      return Err(Error::new(ErrorKind::Other, "TLS redirection breaks certificates chain"));
+      return Err(Error::new(ErrorKind::Other, format!("blocked {dest} as tracker")))
     }
     
-    let server = format!("{dest_server}.run:{dest_port}");  // foundation.ton.run:443
+    let server = if dest_server.ends_with(".ton") {
+      if dest_port == "443" {
+        // terminating connection without response
+        return Err(Error::new(ErrorKind::Other, "TLS redirection breaks certificates chain"))
+      } else {
+        format!("{dest_server}.run:{dest_port}")
+      }
+    } else {
+      dest.to_string()
+    };
     println!("Connecting to {server}");
     
     loop {
       proxy_to.clear();
       rd.read_line(&mut proxy_to).await?;
-      println!("Skipping headers line {proxy_to:?}");
       if proxy_to == "\r\n" {break;}
     }
     
@@ -115,8 +128,8 @@ async fn serve_proxy(mut socket: TcpStream) -> Result<()> {
       rd.read_line(&mut proxy_to).await?;
       
       if proxy_to.to_lowercase().starts_with("host:") {
-        server_socket.write_all(proxy_to.trim_end().as_bytes()).await?;
-        server_socket.write_all(b".run\r\n").await?;
+        server_socket.write_all(format!("Host: {server}\r\n").as_bytes()).await?;
+        break;
       } else {
         server_socket.write_all(proxy_to.as_bytes()).await?;
       }
